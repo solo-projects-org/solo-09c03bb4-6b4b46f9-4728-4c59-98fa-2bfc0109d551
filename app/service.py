@@ -44,12 +44,15 @@ from .attribution import (
     HotspotPoint,
 )
 from .parsing import (
+    BadRow,
     Compartment,
     InputError,
     Hotspot,
+    QuarantineResult,
     geometry_to_wkb,
     parse_compartment_geojson,
     parse_hotspots_csv,
+    parse_hotspots_csv_quarantine,
     sha256_bytes,
     wkb_to_geometry,
 )
@@ -281,6 +284,246 @@ def _insert_run(conn: sqlite3.Connection, batch_id: int, map_version_id: int) ->
         (batch_id, map_version_id, STATUS_QUEUED, db.utc_now(), total),
     )
     return int(cur.lastrowid)
+
+
+# --------------------------------------------------------------------------
+# Quarantine intake (upload -> review bad rows -> confirm into a batch)
+# --------------------------------------------------------------------------
+
+INTAKE_PENDING = "pending"
+INTAKE_CONFIRMED = "confirmed"
+
+
+def _insert_intake_hotspots(
+    conn: sqlite3.Connection, intake_id: int, hotspots: Sequence[Hotspot]
+) -> None:
+    conn.executemany(
+        """
+        INSERT INTO intake_hotspots
+            (intake_id, seq, source_row, hotspot_no, lon, lat, observed_at_utc, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                intake_id,
+                item.seq,
+                item.source_row,
+                item.hotspot_no,
+                item.lon,
+                item.lat,
+                item.observed_at_utc,
+                json.dumps(item.raw, ensure_ascii=False),
+            )
+            for item in hotspots
+        ],
+    )
+
+
+def _insert_bad_rows(conn: sqlite3.Connection, intake_id: int, bad_rows: Sequence[BadRow]) -> None:
+    conn.executemany(
+        """
+        INSERT INTO intake_bad_rows (intake_id, source_row, reason, raw_json)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (intake_id, item.source_row, item.reason, json.dumps(item.raw, ensure_ascii=False))
+            for item in bad_rows
+        ],
+    )
+
+
+def create_intake(db_path: str, data: bytes, filename: str) -> dict[str, Any]:
+    """Quarantine-parse a CSV and persist the reviewable intake.
+
+    File-level problems (missing required columns, column-count mismatch, no
+    valid row, ...) raise ``InputError`` and leave nothing behind.  Row-level
+    problems are stored as bad rows; valid rows wait for explicit confirmation.
+    """
+
+    result: QuarantineResult = parse_hotspots_csv_quarantine(data, filename)
+    digest = sha256_bytes(data)
+    created_at = db.utc_now()
+    with db.connection(db_path) as conn:
+        with db.write_tx(conn):
+            cur = conn.execute(
+                """
+                INSERT INTO intakes
+                    (filename, sha256, created_at, status, valid_count, bad_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    filename,
+                    digest,
+                    created_at,
+                    INTAKE_PENDING,
+                    result.valid_count,
+                    result.bad_count,
+                ),
+            )
+            intake_id = int(cur.lastrowid)
+            _insert_intake_hotspots(conn, intake_id, result.hotspots)
+            _insert_bad_rows(conn, intake_id, result.bad_rows)
+            intake = get_intake(conn, intake_id)
+            assert intake is not None
+    return intake
+
+
+def get_intake(conn: sqlite3.Connection, intake_id: int) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM intakes WHERE id = ?", (intake_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_intakes(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM intakes ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_intake_hotspots(
+    conn: sqlite3.Connection, intake_id: int, limit: int | None = None
+) -> list[dict[str, Any]]:
+    sql = (
+        "SELECT * FROM intake_hotspots WHERE intake_id = ? ORDER BY seq"
+        + (" LIMIT ?" if limit is not None else "")
+    )
+    params: tuple[Any, ...] = (intake_id, limit) if limit is not None else (intake_id,)
+    rows = conn.execute(sql, params).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["raw"] = json.loads(item.pop("raw_json"))
+        out.append(item)
+    return out
+
+
+def list_intake_bad_rows(
+    conn: sqlite3.Connection, intake_id: int, limit: int | None = None
+) -> list[dict[str, Any]]:
+    sql = (
+        "SELECT * FROM intake_bad_rows WHERE intake_id = ? ORDER BY id"
+        + (" LIMIT ?" if limit is not None else "")
+    )
+    params: tuple[Any, ...] = (intake_id, limit) if limit is not None else (intake_id,)
+    rows = conn.execute(sql, params).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["raw"] = json.loads(item.pop("raw_json"))
+        out.append(item)
+    return out
+
+
+def count_batch_bad_rows(conn: sqlite3.Connection, batch_id: int) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM intake_bad_rows br
+        JOIN intakes i ON i.id = br.intake_id
+        JOIN batches b ON b.intake_id = i.id
+        WHERE b.id = ?
+        """,
+        (batch_id,),
+    ).fetchone()
+    return int(row["n"])
+
+
+def list_batch_bad_rows(
+    conn: sqlite3.Connection, batch_id: int, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """Bad rows retained with a confirmed batch; they never enter attribution."""
+
+    sql = """
+        SELECT br.source_row, br.reason, br.raw_json, i.filename
+        FROM intake_bad_rows br
+        JOIN intakes i ON i.id = br.intake_id
+        JOIN batches b ON b.intake_id = i.id
+        WHERE b.id = ?
+        ORDER BY br.id
+    """
+    params: tuple[Any, ...] = (batch_id,)
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (batch_id, limit)
+    rows = conn.execute(sql, params).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["raw"] = json.loads(item.pop("raw_json"))
+        out.append(item)
+    return out
+
+
+def confirm_intake(db_path: str, intake_id: int) -> tuple[int, int | None]:
+    """Turn a pending intake into one batch with its first queued run.
+
+    The whole transition (claim the intake, insert the batch, copy only valid
+    rows into ``hotspots``, create the first run against the *currently active*
+    map, link the bad rows) happens in a single ``BEGIN IMMEDIATE``
+    transaction.  Therefore:
+
+    * two web instances confirming the same pending intake produce exactly one
+      batch and one first run — the losing transaction re-reads the intake and
+      returns the already-created batch id instead of inserting again;
+    * an interrupted confirmation cannot leave a received-but-unqueued batch:
+      either every statement commits together or nothing does.
+
+    Returns ``(batch_id, run_id)``.  ``run_id`` is ``None`` only when no map is
+    active; the route layer rejects that case before calling this function.
+    """
+
+    with db.connection(db_path) as conn:
+        with db.write_tx(conn):
+            intake = conn.execute(
+                "SELECT * FROM intakes WHERE id = ?", (intake_id,)
+            ).fetchone()
+            if intake is None:
+                raise ServiceError("待接收文件不存在")
+            if intake["status"] == INTAKE_CONFIRMED:
+                # Idempotent across double-clicks and racing instances.
+                batch_id = int(intake["batch_id"])
+                latest = conn.execute(
+                    "SELECT id FROM runs WHERE batch_id = ? ORDER BY id LIMIT 1", (batch_id,)
+                ).fetchone()
+                return batch_id, int(latest["id"]) if latest else None
+            active = get_active_map(conn)
+            if active is None:
+                raise ServiceError("尚未上传林班底图，请先上传活动底图后再确认接收")
+
+            cur = conn.execute(
+                """
+                INSERT INTO batches
+                    (name, filename, sha256, row_count, created_at, intake_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    Path(intake["filename"]).stem or "热点批次",
+                    intake["filename"],
+                    intake["sha256"],
+                    int(intake["valid_count"]),
+                    db.utc_now(),
+                    intake_id,
+                ),
+            )
+            batch_id = int(cur.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO hotspots
+                    (batch_id, seq, source_row, hotspot_no, lon, lat, observed_at_utc, raw_json)
+                SELECT ?, seq, source_row, hotspot_no, lon, lat, observed_at_utc, raw_json
+                FROM intake_hotspots WHERE intake_id = ?
+                """,
+                (batch_id, intake_id),
+            )
+            run_id = _insert_run(conn, batch_id, active.id)
+            claimed = conn.execute(
+                "UPDATE intakes SET status = ?, batch_id = ? WHERE id = ? AND status = ?",
+                (INTAKE_CONFIRMED, batch_id, intake_id, INTAKE_PENDING),
+            ).rowcount
+            if claimed != 1:  # pragma: no cover - defensive; ux_intakes_confirmed also guards
+                raise ServiceError("该待接收文件已被另一实例确认")
+    return batch_id, run_id
 
 
 def claim_next_run(db_path: str) -> tuple[int, str] | None:

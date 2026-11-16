@@ -84,6 +84,7 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
             active_map = service.get_active_map(c)
             batches = service.list_batches(c)
             maps = service.list_maps(c, limit=10)
+            intakes = service.list_intakes(c)
         return render(
             request,
             "index.html",
@@ -91,6 +92,7 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 "active_map": active_map,
                 "maps": maps,
                 "batches": batches,
+                "intakes": intakes,
                 "msg": msg,
                 "err": err,
                 "max_mb": app.state.settings["upload_max_mb"],
@@ -148,6 +150,78 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
         kick_worker()
         return _redirect(f"/batches/{batch_id}", msg=f"热点批次 #{batch_id} 已上传，计算已排队")
 
+    @app.post("/intakes")
+    def upload_intake(request: Request, file: UploadFile = File(...)):
+        """Quarantine upload: never creates a batch, only a reviewable intake."""
+
+        try:
+            data = _read_upload(file, app.state.settings["upload_max_mb"], "热点 CSV")
+            intake = service.create_intake(
+                app.state.settings["db_path"], data, _safe_filename(file.filename, "hotspots.csv")
+            )
+        except InputError as exc:
+            return _redirect("/", err=f"隔离接收整份拒收：{exc}")
+        note = (
+            f"待接收文件 #{intake['id']} 已隔离：{intake['valid_count']} 行有效，"
+            f"{intake['bad_count']} 个坏行待核对"
+        )
+        return _redirect(f"/intakes/{intake['id']}", msg=note)
+
+    @app.get("/intakes/{intake_id}", response_class=HTMLResponse)
+    def intake_detail(
+        request: Request,
+        intake_id: int,
+        msg: str | None = None,
+        err: str | None = None,
+    ):
+        with conn() as c:
+            intake = service.get_intake(c, intake_id)
+            if intake is None:
+                raise HTTPException(status_code=404, detail="待接收文件不存在")
+            active_map = service.get_active_map(c)
+            bad_rows = service.list_intake_bad_rows(
+                c, intake_id, limit=app.state.settings["per_page"]
+            )
+            valid_preview = service.list_intake_hotspots(
+                c, intake_id, limit=app.state.settings["per_page"]
+            )
+        return render(
+            request,
+            "intake.html",
+            {
+                "intake": intake,
+                "active_map": active_map,
+                "bad_rows": bad_rows,
+                "valid_preview": valid_preview,
+                "msg": msg,
+                "err": err,
+                "per_page": app.state.settings["per_page"],
+            },
+        )
+
+    @app.post("/intakes/{intake_id}/confirm")
+    def confirm_intake(request: Request, intake_id: int):
+        # Friendly pre-check so the UI can say "upload a map first"; the service
+        # enforces the same rule inside the write transaction.
+        with conn() as c:
+            active = service.get_active_map(c)
+        if active is None:
+            return _redirect(
+                f"/intakes/{intake_id}",
+                err="尚无活动林班底图，请先在首页上传底图后再确认接收",
+            )
+        try:
+            batch_id, run_id = service.confirm_intake(app.state.settings["db_path"], intake_id)
+        except service.ServiceError as exc:
+            return _redirect(f"/intakes/{intake_id}", err=str(exc))
+        if run_id is None:
+            return _redirect(f"/batches/{batch_id}", msg=f"批次 #{batch_id} 已建立；上传底图后即可计算")
+        kick_worker()
+        return _redirect(
+            f"/batches/{batch_id}",
+            msg=f"已确认接收：批次 #{batch_id} 建立，初次计算任务 #{run_id} 已排队（坏行不参与归属）",
+        )
+
     @app.post("/batches/{batch_id}/recompute")
     def recompute(request: Request, batch_id: int):
         try:
@@ -186,6 +260,10 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 else []
             )
             pending = service.is_run_active(c, batch_id)
+            bad_total = service.count_batch_bad_rows(c, batch_id)
+            bad_rows = service.list_batch_bad_rows(
+                c, batch_id, limit=app.state.settings["per_page"]
+            )
         return render(
             request,
             "batch.html",
@@ -198,6 +276,8 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 "preview": preview,
                 "only_problems": only == "problems",
                 "pending": pending,
+                "bad_rows": bad_rows,
+                "bad_total": bad_total,
                 "msg": msg,
                 "err": err,
                 "per_page": app.state.settings["per_page"],

@@ -50,6 +50,36 @@
   {% endif %}
 </section>
 
+{% if bad_rows %}
+<section class="card">
+  <h2>随批次留存的坏行（共 {{ bad_total }} 行，不参与归属，重算也不纳入）</h2>
+  <p class="hint">这些行在隔离接收时被拦下；批次仅含 {{ batch.row_count }} 个有效热点。
+    {% if bad_total > bad_rows|length %}页面仅展示前 {{ bad_rows|length }} 行，全部坏行已在数据库留存。{% endif %}</p>
+  <div class="table-wrap">
+  <table class="rows">
+    <thead>
+      <tr><th>来源行号</th><th>隔离原因</th><th>原值（上传行内容）</th></tr>
+    </thead>
+    <tbody>
+    {% for row in bad_rows %}
+      <tr class="row-warn">
+        <td>{{ row.source_row }}</td>
+        <td class="reason">{{ row.reason }}</td>
+        <td>
+          <table class="compact inner-table">
+            {% for key, value in row.raw.items() %}
+            <tr><th>{{ key }}</th><td class="mono">{{ value if value != '' else '（空）' }}</td></tr>
+            {% endfor %}
+          </table>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
 {% if published and counts %}
 <section class="card">
   <h2>冲突原因分布</h2>

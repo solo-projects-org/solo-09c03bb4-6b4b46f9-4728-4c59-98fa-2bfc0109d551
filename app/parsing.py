@@ -74,6 +74,38 @@ class Hotspot:
     raw: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class BadRow:
+    """A source row rejected during quarantine intake.
+
+    ``raw`` keeps the original header->value mapping so the duty officer can
+    inspect the exact source text, and ``reason`` lists every field-level
+    problem found on that row.
+    """
+
+    source_row: int
+    reason: str
+    raw: dict[str, str]
+
+
+@dataclass
+class QuarantineResult:
+    hotspots: list[Hotspot]
+    bad_rows: list[BadRow]
+
+    @property
+    def valid_count(self) -> int:
+        return len(self.hotspots)
+
+    @property
+    def bad_count(self) -> int:
+        return len(self.bad_rows)
+
+    @property
+    def total_rows(self) -> int:
+        return len(self.hotspots) + len(self.bad_rows)
+
+
 _TS_PATTERNS = (
     "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%d %H:%M:%S",
@@ -187,6 +219,121 @@ def parse_hotspots_csv(data: bytes, filename: str) -> list[Hotspot]:
     if not rows:
         raise InputError("热点 CSV 没有数据行")
     return rows
+
+
+def _row_to_record(headers: list[str], values: list[str]) -> dict[str, str]:
+    record: dict[str, str] = {}
+    for index, header in enumerate(headers):
+        if not header.strip():
+            continue
+        record[header] = values[index] if index < len(values) else ""
+    return record
+
+
+def parse_hotspots_csv_quarantine(data: bytes, filename: str) -> QuarantineResult:
+    """Lenient two-outcome parse for the quarantine intake page.
+
+    Whole-file rejections (``InputError``):
+      * empty/undecodable/oversized file, missing header or missing required
+        columns (the file cannot be interpreted at all);
+      * any data row whose column count differs from the header;
+      * no valid row remains after quarantine.
+
+    Row-level quarantine (collected in ``bad_rows``):
+      * empty hotspot number, unparsable/out-of-range coordinates, or an
+        unparseable UTC timestamp.  Every field problem on the row is reported
+        together so the officer sees the full reason list in one review pass.
+
+    Blank physical lines are skipped, matching the strict upload path.
+    """
+
+    if not data:
+        raise InputError("热点 CSV 为空")
+    if len(data) > MAX_CSV_BYTES:
+        raise InputError(f"热点 CSV 超过 {MAX_CSV_BYTES // 1024 // 1024} MB 限制")
+    text = _decode(data, "热点 CSV")
+    reader = csv.reader(io.StringIO(text, newline=""))
+    try:
+        headers = next(reader)
+    except StopIteration:
+        raise InputError("热点 CSV 缺少表头") from None
+    headers = [cell.strip() for cell in headers]
+    if not any(headers):
+        raise InputError("热点 CSV 缺少表头")
+    mapping = _map_columns(headers, HOTSPOT_ALIASES, ["hotspot_no", "lon", "lat", "observed_at"])
+
+    hotspots: list[Hotspot] = []
+    bad_rows: list[BadRow] = []
+    for source_row, values in enumerate(reader, start=2):
+        if not values or not any(cell.strip() for cell in values):
+            continue  # blank line
+        if len(hotspots) + len(bad_rows) >= MAX_ROWS:
+            raise InputError(f"热点数量超过 {MAX_ROWS} 行限制")
+        if len(values) != len(headers):
+            raise InputError(
+                f"第 {source_row} 行列数（{len(values)}）与表头（{len(headers)}）不符，整份文件拒收"
+            )
+        record = _row_to_record(headers, values)
+        problems: list[str] = []
+        hotspot_no = (record.get(mapping["hotspot_no"]) or "").strip()
+        if not hotspot_no:
+            problems.append("热点号为空")
+        lon = _parse_coord_optional(record, mapping, "lon", "经度", -180.0, 180.0, problems)
+        lat = _parse_coord_optional(record, mapping, "lat", "纬度", -90.0, 90.0, problems)
+        observed_text = (record.get(mapping["observed_at"]) or "").strip()
+        observed: str | None = None
+        if not observed_text:
+            problems.append("UTC 时刻为空")
+        else:
+            try:
+                observed = parse_utc(observed_text)
+            except InputError as exc:
+                problems.append(f"UTC 时刻无效：{exc}")
+        if problems:
+            bad_rows.append(BadRow(source_row=source_row, reason="；".join(problems), raw=record))
+            continue
+        hotspots.append(
+            Hotspot(
+                seq=len(hotspots),
+                source_row=source_row,
+                hotspot_no=hotspot_no,
+                lon=lon,
+                lat=lat,
+                observed_at_utc=observed,
+                raw={str(k): str(v) for k, v in record.items()},
+            )
+        )
+    if not hotspots and not bad_rows:
+        raise InputError("热点 CSV 没有数据行")
+    if not hotspots:
+        raise InputError(
+            f"全部 {len(bad_rows)} 个数据行均为坏行（首个原因：第 {bad_rows[0].source_row} 行 {bad_rows[0].reason}），整份文件拒收"
+        )
+    return QuarantineResult(hotspots=hotspots, bad_rows=bad_rows)
+
+
+def _parse_coord_optional(
+    record: dict[str, str],
+    mapping: dict[str, str],
+    canonical: str,
+    label: str,
+    lo: float,
+    hi: float,
+    problems: list[str],
+) -> float | None:
+    text = (record.get(mapping[canonical]) or "").strip()
+    if not text:
+        problems.append(f"{label}为空")
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        problems.append(f"{label} {text!r} 不是数字")
+        return None
+    if not (lo <= number <= hi):
+        problems.append(f"{label} {number} 超出范围 [{lo}, {hi}]")
+        return None
+    return number
 
 
 # --------------------------------------------------------------------------

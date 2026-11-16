@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}待接收文件 #{{ intake.id }} · 隔离核对{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="split">
+    <div>
+      <h2>待接收文件 #{{ intake.id }} <span class="muted mono">{{ intake.filename }}</span></h2>
+      <p class="hint">上传于 {{ intake.created_at }} · 隔离接收：先核对坏行，确认后才会建立批次并排队。</p>
+    </div>
+    <div class="actions">
+      <a class="button secondary" href="/">返回首页</a>
+      {% if intake.status == 'confirmed' and intake.batch_id %}
+        <a class="button" href="/batches/{{ intake.batch_id }}">查看批次 #{{ intake.batch_id }}</a>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="stat-row">
+    <div class="stat"><span class="num">{{ intake.valid_count + intake.bad_count }}</span><span class="lbl">数据行</span></div>
+    <div class="stat stat-ok"><span class="num">{{ intake.valid_count }}</span><span class="lbl">有效行</span></div>
+    <div class="stat stat-warn"><span class="num">{{ intake.bad_count }}</span><span class="lbl">坏行（隔离）</span></div>
+  </div>
+
+  {% if intake.status == 'confirmed' %}
+    <div class="flash flash-ok">
+      该文件已于批次 #{{ intake.batch_id }} 确认接收；仅 {{ intake.valid_count }} 个有效行进入归属明细，
+      {{ intake.bad_count }} 个坏行随批次留存，重算也不会纳入。
+    </div>
+  {% else %}
+    {% if not active_map %}
+      <div class="flash flash-warn">
+        当前没有活动林班底图。请先到首页上传林班 GeoJSON，底图发布后才能确认接收并排队计算。
+      </div>
+    {% else %}
+      <p class="hint">确认时将按当前活动底图 <strong>v{{ active_map.id }} · {{ active_map.filename }}</strong>
+        建立批次，并立即排队初次归属计算。</p>
+    {% endif %}
+    <form method="post" action="/intakes/{{ intake.id }}/confirm" class="inline">
+      <button type="submit" {% if not active_map %}disabled{% endif %}>
+        确认接收（{{ intake.valid_count }} 行有效，{{ intake.bad_count }} 行隔离）
+      </button>
+    </form>
+  {% endif %}
+</section>
+
+{% if bad_rows %}
+<section class="card">
+  <h2>坏行核对（共 {{ intake.bad_count }} 行被隔离，不进入归属计算）</h2>
+  <p class="hint">原因逐行列出；原值保留上传时的整行内容，便于回溯来源系统。
+    {% if intake.bad_count > bad_rows|length %}页面仅展示前 {{ bad_rows|length }} 行，全部坏行已随接收记录留存。{% endif %}</p>
+  <div class="table-wrap">
+  <table class="rows">
+    <thead>
+      <tr><th>来源行号</th><th>隔离原因</th><th>原值（上传行内容）</th></tr>
+    </thead>
+    <tbody>
+    {% for row in bad_rows %}
+      <tr class="row-warn">
+        <td>{{ row.source_row }}</td>
+        <td class="reason">{{ row.reason }}</td>
+        <td>
+          <table class="compact inner-table">
+            {% for key, value in row.raw.items() %}
+            <tr><th>{{ key }}</th><td class="mono">{{ value if value != '' else '（空）' }}</td></tr>
+            {% endfor %}
+          </table>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>有效行预览（前 {{ [valid_preview|length, per_page]|min }} 行，共 {{ intake.valid_count }} 行）</h2>
+  <div class="table-wrap">
+  <table class="rows">
+    <thead>
+      <tr><th>来源行号</th><th>热点号</th><th>经度</th><th>纬度</th><th>UTC 时刻</th></tr>
+    </thead>
+    <tbody>
+    {% for row in valid_preview %}
+      <tr class="row-ok">
+        <td>{{ row.source_row }}</td>
+        <td class="mono">{{ row.hotspot_no }}</td>
+        <td class="mono">{{ '%.6f'|format(row.lon) }}</td>
+        <td class="mono">{{ '%.6f'|format(row.lat) }}</td>
+        <td class="mono">{{ row.observed_at_utc }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endblock %}

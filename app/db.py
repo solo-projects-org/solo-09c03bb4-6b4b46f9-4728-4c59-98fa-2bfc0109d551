@@ -46,8 +46,48 @@ CREATE TABLE IF NOT EXISTS batches (
     sha256          TEXT NOT NULL,
     row_count       INTEGER NOT NULL,
     created_at      TEXT NOT NULL,
-    published_run_id INTEGER
+    published_run_id INTEGER,
+    intake_id       INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS intakes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename        TEXT NOT NULL,
+    sha256          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    status          TEXT NOT NULL,           -- pending|confirmed
+    valid_count     INTEGER NOT NULL,
+    bad_count       INTEGER NOT NULL,
+    batch_id        INTEGER REFERENCES batches(id)
+);
+
+-- An intake is confirmed at most once; the partial unique index makes the
+-- claim safe even if two web instances confirm at exactly the same moment.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_intakes_confirmed
+    ON intakes (batch_id) WHERE status = 'confirmed';
+CREATE INDEX IF NOT EXISTS ix_intakes_status ON intakes (status, id);
+
+CREATE TABLE IF NOT EXISTS intake_hotspots (
+    intake_id       INTEGER NOT NULL REFERENCES intakes(id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL,
+    source_row      INTEGER NOT NULL,
+    hotspot_no      TEXT NOT NULL,
+    lon             REAL NOT NULL,
+    lat             REAL NOT NULL,
+    observed_at_utc TEXT NOT NULL,
+    raw_json        TEXT NOT NULL,
+    PRIMARY KEY (intake_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS intake_bad_rows (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    intake_id       INTEGER NOT NULL REFERENCES intakes(id) ON DELETE CASCADE,
+    source_row      INTEGER NOT NULL,
+    reason          TEXT NOT NULL,
+    raw_json        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_intake_bad_rows ON intake_bad_rows (intake_id, id);
 
 CREATE TABLE IF NOT EXISTS hotspots (
     batch_id        INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
@@ -103,6 +143,14 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Lightweight additive migrations for databases created by older versions."""
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(batches)").fetchall()}
+    if "intake_id" not in columns:
+        conn.execute("ALTER TABLE batches ADD COLUMN intake_id INTEGER")
+
+
 def init_db(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
@@ -113,6 +161,7 @@ def init_db(db_path: str) -> None:
             # switching can briefly return SQLITE_BUSY, hence the retry.
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
+            _migrate(conn)
             return
         except sqlite3.OperationalError as exc:
             last_error = exc

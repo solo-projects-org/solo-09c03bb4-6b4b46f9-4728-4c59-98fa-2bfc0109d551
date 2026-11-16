@@ -223,3 +223,96 @@ def test_concurrent_map_swaps_leave_exactly_one_active(tmp_path):
     finally:
         server_a.stop()
         server_b.stop()
+
+
+def _mixed_csv_bytes() -> bytes:
+    return (
+        "hotspot_no,lon,lat,observed_at\n"
+        "H-1,100.05,25.05,2026-03-01T02:10:00Z\n"
+        "H-2,100.08,25.05,2026-03-01T02:12:30Z\n"
+        "H-3,181.0,25.05,2026-03-01T02:14:00Z\n"          # bad longitude, isolated
+        ",100.08,25.08,2026-03-01T02:15:00Z\n"            # empty hotspot id, isolated
+        "H-5,100.10,25.10,not-a-time\n"                   # bad timestamp, isolated
+    ).encode()
+
+
+@pytest.mark.slow
+def test_two_servers_confirm_same_intake_once(tmp_path):
+    """Concurrent confirmation on two instances yields one batch and one run."""
+
+    db_path = tmp_path / "forest.db"
+    port_a, port_b = free_port(), free_port()
+    server_a = Server(db_path, port_a, tmp_path)
+    server_b = Server(db_path, port_b, tmp_path)
+    server_a.wait_ready()
+    server_b.wait_ready()
+    try:
+        with httpx.Client(base_url=server_a.base, timeout=30) as client_a, httpx.Client(
+            base_url=server_b.base, timeout=30
+        ) as client_b:
+            upload_map(client_a, "v1.geojson", (SAMPLES / "compartments_v1.geojson").read_bytes())
+
+            response = client_a.post(
+                f"{client_a.base_url}/intakes",
+                files={"file": ("mixed.csv", _mixed_csv_bytes(), "text/csv")},
+                follow_redirects=False,
+            )
+            assert response.status_code == 303
+            assert response.headers["location"].startswith("/intakes/1")
+
+            review = client_a.get(f"{client_a.base_url}/intakes/1")
+            assert review.status_code == 200
+            assert "2" in review.text and "热点号为空" in review.text
+
+            import threading
+
+            redirects: list[httpx.Response] = []
+            errors: list[BaseException] = []
+
+            def confirm(client):
+                try:
+                    redirects.append(
+                        client.post(
+                            f"{client.base_url}/intakes/1/confirm", follow_redirects=False
+                        )
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=confirm, args=(client_a,)),
+                threading.Thread(target=confirm, args=(client_b,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            assert not errors
+            assert all(r.status_code == 303 for r in redirects)
+            assert all(r.headers["location"].startswith("/batches/1") for r in redirects)
+
+            final = wait_published(client_a, 1)
+            # Only the two valid rows entered attribution; the three bad rows
+            # stay with the batch but out of every run.
+            assert final["published_total"] == 2
+            assert len(final["runs"]) == 1
+            assert final["runs"][0]["status"] == "succeeded"
+
+            from app import db as db_module
+
+            with db_module.connection(str(db_path)) as conn:
+                assert conn.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"] == 1
+                assert conn.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"] == 1
+                assert conn.execute("SELECT COUNT(*) AS n FROM hotspots").fetchone()["n"] == 2
+                assert (
+                    conn.execute("SELECT COUNT(*) AS n FROM intake_bad_rows").fetchone()["n"] == 3
+                )
+                intake = conn.execute("SELECT * FROM intakes WHERE id=1").fetchone()
+                assert intake["status"] == "confirmed" and intake["batch_id"] == 1
+
+            # Bad rows are still visible on the batch page after confirmation.
+            batch_page = client_b.get(f"{client_b.base_url}/batches/1").text
+            assert "随批次留存的坏行" in batch_page and "not-a-time" in batch_page
+    finally:
+        server_a.stop()
+        server_b.stop()
